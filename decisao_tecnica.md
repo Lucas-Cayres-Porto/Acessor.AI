@@ -61,16 +61,19 @@ Colocar um modelo para julgar o pedido do usuário antes de deixar a ferramenta 
 
 ## 3. O efeito nas métricas do SRE, e como
 
-No monitor de observabilidade da Etapa 6, essas escolhas afetam diretamente os indicadores e metas:
+No monitor de observabilidade da Etapa 6, fizemos a comparação direta entre a versão anterior do projeto em `migracao_fastAPI_pos_prova` e a versão atual em `juiz_tardio`:
+
+**Comparação com o projeto anterior:**  
+No projeto anterior `migracao_fastAPI_pos_prova`, a média de latência do turno já ficava entre 6,9 s e 7,5 s, com o p95 dentro da meta de 8 segundos e a taxa de erro marcando status `ok` ao devolver a frase segura. No entanto, aquele status `ok` escondia uma falha crítica de integridade: a escrita errada já tinha sido gravada no PostgreSQL antes da decisão do juiz. Na versão atual `juiz_tardio`, o tempo de resposta permanece praticamente idêntico, gastando apenas de 3 a 8 ms a mais para comitar no banco se o juiz aprovar, e economizando cerca de 20 ms nas recusas porque nem tenta gravar. A grande diferença é que agora o status `ok` reflete a realidade, pois nenhuma linha entra no banco se o juiz recusar.
 
 **Latência do turno e p95 com meta de 8 segundos:**  
-A média do turno fica entre 6,9 s e 7,5 s. Na decisão de adiar, o p95 fica abaixo de 8 s porque o nó efetivador roda em memória e só gasta de 3 a 8 ms para comitar no banco, e ainda economiza 20 ms na recusa porque nem chega a gravar. Já em transacionar, manter uma conexão aberta à espera do veredito por 7 a 8 segundos cria fila no banco e estoura o p95. Em interceptar, fazer uma chamada a mais de LLM adiciona 2 segundos fixos e estoura a meta de 8 s.
+Tanto no projeto anterior quanto no atual, a média fica entre 6,9 s e 7,5 s, mantendo o p95 abaixo do limite de 8 segundos. Já na opção descartada de transacionar, manter uma conexão aberta à espera do veredito por 7 a 8 segundos criaria filas no banco e faria o p95 estourar a meta. Na opção de interceptar, o mecanismo de uma chamada a mais de modelo adicionaria 2 segundos fixos no caminho crítico, jogando a latência para a faixa de 9 a 10 segundos e violando o limite de 8 segundos.
 
 **Taxa de erro com meta de 5% e status ok, erro e bloqueado:**  
-Na decisão de adiar, a taxa de erro adicional é zero. O mecanismo é um turno que termina em frase segura sem exceção: a recusa do juiz apenas limpa a memória, sem lançar erro no código, marcando status `ok`. O status `bloqueado` é só para o guardrail de entrada, que não conta como erro segundo as regras estabelecidas. O status `erro` só sobe em falhas técnicas reais. Em transacionar, a falta de conexões gera erro `OperationalError`, estourando os 5%. Em compensar, ter um segundo efeito, que é o comando de delete corretivo, cria risco de falha de rede.
+Tanto antes quanto agora, a taxa de erro adicional é zero, cumprindo com folga a meta de 5%. O mecanismo adotado é um turno que termina em frase segura sem exceção: a recusa do juiz apenas limpa a memória, sem lançar erro no código, marcando status `ok`. O status `bloqueado` é exclusivo do guardrail de entrada, que não conta como erro segundo as regras de monitoramento. O status `erro` só é disparado quando há falha técnica no código. Em transacionar, a falta de conexões no pool geraria o erro `OperationalError`, estourando a taxa de 5%. Em compensar, ter um segundo efeito, que é o comando de delete corretivo após a recusa, traria risco de falha de rede e geraria erros no monitor.
 
 **Tokens e custo:**  
-Em adiar, o custo e o uso de tokens são exatamente zero a mais, pois o staging roda só na memória RAM. Em interceptar, uma chamada a mais gastaria cerca de 1.000 tokens extras por mensagem, encarecendo a operação em mais de 30%.
+Em relação ao projeto anterior, a estratégia de adiar teve impacto zero no consumo de tokens e no custo de API, pois a fila de staging roda somente na memória RAM. Por outro lado, na opção de interceptar, uma chamada a mais gastaria cerca de 1.000 tokens extras por mensagem, encarecendo a operação em mais de 30%.
 
 ---
 
