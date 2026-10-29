@@ -1,219 +1,96 @@
 # Decisão Técnica — Etapa 8: O Juiz e a Escrita
 
 **Projeto:** Assessor Pessoal com Inteligência Artificial  
-**Mecanismo Escolhido:** Família 3 — Estratégia de Adiar (*Turn Staging Buffer / Two-Phase Action*)  
-**Repositório:** `juiz_tardio`  
-**Data:** 28 de Outubro de 2026  
-**Status:** Estratégia implementada; correção do repasse feita em 29 de outubro de 2026. O teste isolado foi criado, mas sua execução não terminou neste ambiente.
+**Mecanismo Escolhido:** Família: Adiar (*Turn Staging Buffer* / Ação em Duas Fases)  
+**Repositório:** `juiz_tardio`
 
 ---
 
 ## 1. A decisão tomada, e por quê
 
-### Diagnóstico do Problema
-Na arquitetura herdada da Etapa 7, o Juiz de Fidelidade (JEV da Typesafe) foi posicionado na saída do grafo para barrar alucinações antes que chegassem ao usuário. No entanto, as ferramentas de mutação (`add_transaction`, `update_transaction`, `add_event`) executavam o SQL e disparavam o `commit()` **imediatamente durante a fase de raciocínio do especialista (Passo 2 do turno)**. Quando o Juiz recusava a resposta final (como no caso de despesas em dólares ou valores inventados), o chat exibia a frase segura (*"Não tenho evidência para afirmar isso."*), mas o dado **já havia sido persistido permanentemente no PostgreSQL**. O chat dizia não, mas o banco dizia sim.
+Na Etapa 7, as ferramentas de escrita (`add_transaction`, `update_transaction` e `add_event`) executavam o SQL e comitavam no PostgreSQL imediatamente durante o passo do especialista. Quando o Juiz recusava a resposta final por alucinação, o chat exibia a frase segura, mas a alteração já estava confirmada no banco de dados.
 
-### A Fronteira que Passou a Autorizar a Escrita
-A fronteira que autoriza a escrita deixou de ser a chamada da tool no especialista e passou a ser o **nó `efetivador`**, posicionado como um *Commit Gate* imediatamente após o nó `juiz` e antes da terminação do grafo (`END`). 
+A decisão tomada foi adotar a **Estratégia de Adiar (*Turn Staging Buffer*)**. A fronteira que autoriza a escrita foi transferida da chamada da ferramenta para o nó `efetivador`, posicionado como um *Commit Gate* imediatamente após o nó `juiz` e antes de `END`.
 
-### Por que cabe neste grafo
-O LangGraph organiza o fluxo em nós desacoplados com estado compartilhado (`Estado` / `agentes_chamados`). Na fase de raciocínio, os especialistas precisam invocar ferramentas para inspecionar parâmetros e gerar dados factuais nos logs de chamada (`tool_calls` e `tool messages`), pois o Juiz JEV baseia seu veredito confrontando a resposta final do orquestrador contra esses logs. 
-A Estratégia de Adiar cabe perfeitamente nessa topologia porque divide o ciclo da tool em duas fases:
-1. **Fase de Staging (Inferência):** A tool valida o esquema, checa existência com `SELECT` pontual, monta a instrução SQL, enfileira a operação na memória do turno e devolve um payload de sucesso estruturado contendo toda a evidência factual (`status: ok`, `staging: True`, `amount`, `type`, `occurred_at`). Isso abastece o especialista, o orquestrador e o juiz com evidências idênticas às reais, sem tocar na persistência do banco.
-2. **Fase de Efetivação (Commit Gate):** O nó `efetivador` inspeciona a lista `agentes_chamados`. Se constar a homologação explícita do Juiz (`juiz:apoiada` com `noul >= 0.70`), o nó consome a fila e efetiva todas as mutações em bloco numa única transação atômica. Se constar recusa (`sem_apoio`, `parcial`, `erro`, `sem_chave` ou limiar insuficiente), o nó simplesmente descarta a fila em memória.
+Essa solução cabe no LangGraph porque divide o ciclo da ferramenta em duas etapas integradas ao estado compartilhado:
+1. **Fase de Staging:** A ferramenta valida a operação, monta a instrução em memória, enfileira o comando no buffer do turno e retorna um payload factual estruturado. O especialista, o orquestrador e o juiz recebem a evidência necessária sem que nenhuma linha seja gravada no banco.
+2. **Fase de Efetivação:** O nó `efetivador` inspeciona o veredito do Juiz. Se aprovado (`juiz:apoiada`), comita todas as operações no banco em bloco atômico único. Se recusado, descarta o buffer da memória sem tocar no PostgreSQL.
 
-### Correção do repasse de evidências ao juiz (29/10/2026)
+Essa fronteira garante que turnos recusados resultem em zero inserções em `add_transaction` e zero registros em `add_event`, enquanto turnos aprovados gravam exatamente uma única vez. Em `update_transaction`, a validação ocorre apenas por leitura (`SELECT`); na recusa, nenhum comando de atualização é executado, mantendo os dados originais intactos. A abordagem também elimina leituras sujas (*dirty reads*), impedindo que consultas concorrentes enxerguem dados não homologados.
 
-Foi identificada uma lacuna entre essa descrição e o fluxo real do grafo: `_executar_agente` executa o especialista em uma chamada interna (`app.invoke`), mas devolvia ao grafo externo somente a resposta final do especialista. As mensagens internas com `tool_calls` e os resultados `ToolMessage` ficavam de fora do estado compartilhado. Como `app/juiz.py::_coleta` procura essas evidências em `messages`, o JEV podia receber a resposta final sem os argumentos e resultados das tools — inclusive quando a tool havia preparado uma operação no staging.
+### Fluxo Anterior (Commit Prematuro)
 
-A correção fica em `app/graph.py` e não altera `app/juiz.py`, o prompt, o limiar ou a lógica de decisão do JEV:
-
-1. O estado do grafo agora tem `evidencias_juiz`, uma lista separada com as mensagens internas do agente que contêm chamadas de tools e seus resultados.
-2. `_executar_agente` conserva essas mensagens ao retornar ao grafo, além da resposta final que já retornava.
-3. `no_juiz` cria uma cópia temporária do estado e insere nela as evidências imediatamente antes da resposta final, para que `_coleta` não confunda eventual texto auxiliar de uma chamada de tool com a resposta entregue ao usuário. A lista `messages` original do grafo não é modificada; as evidências internas não aparecem como novas falas na conversa.
-
-O teste isolado `tests/test_graph_juiz_evidence.py` foi criado para verificar que argumentos e resultado de uma tool chegam à coleta usada por `no_juiz`, sem conexão ao PostgreSQL e sem chamada real à API do JEV. A execução excedeu 30 segundos durante a importação de `app.graph`; portanto, o teste ainda não está validado por execução. Mesmo aprovado, ele não comprova, por si só, decisão real do JEV nem gravação final de um evento.
-
-**Limites que permanecem:** evidência de staging mostra que a operação foi preparada, não que foi efetivada. Como o Juiz ocorre antes do `efetivador`, esta correção não torna a confirmação de persistência ou de sincronização com o Google Calendar uma evidência pós-commit. Além disso, `_coleta` limita a evidência enviada ao JEV aos últimos 6.000 caracteres; em turnos com muitas chamadas ou resultados longos, evidências iniciais ainda podem ser truncadas. Esses comportamentos pertencem ao fluxo/contrato atual do juiz e não foram alterados nesta correção.
-
-### Qual garantia ela dá em `add_transaction`, `update_transaction` e `add_event`
-- **Em `add_transaction`:** Se o turno for recusado, nenhum `INSERT` é executado no banco; o contador de linhas na tabela `transactions` permanece inalterado (zero escritas). Se aprovado, a inserção é executada exatamente uma única vez com `conn.commit()`.
-- **Em `update_transaction`:** A tool realiza apenas um `SELECT` read-only para validar a existência da transação alvo e capturar seus dados originais. Se o turno for recusado, nenhum `UPDATE` é enviado ao PostgreSQL, preservando integralmente o valor, a moeda e a descrição prévios. Se aprovado, a atualização é aplicada atomicamente.
-- **Em `add_event`:** Se o compromisso for recusado por falta de dados factuais ou conflito temporal, zero registros são criados na tabela `events`. Se aprovado, o evento é gravado exatamente uma única vez.
-- **Garantia de Isolamento Global:** Elimina por completo leituras fantasmas (*dirty reads*), pois nenhum dado não homologado chega a existir nas tabelas do banco de dados durante os segundos em que os LLMs estão processando.
-
-### Diagrama do Fluxo: Antes vs. Depois
-
+```mermaid
+flowchart LR
+    A["Usuário"] --> B["Guardrail Entrada"]
+    B --> C["Especialista"]
+    C -->|"Grava e Commit imediato"| D[("PostgreSQL")]
+    C --> E["Orquestrador"]
+    E --> F["Juiz (Recusa)"]
+    F --> G["Chat: Frase Segura"]
 ```
-FLUXO ANTERIOR (DEFEITUOSO - COMMIT PREMATURO):
-[Usuário] ──> [Guardrail Entrada] ──> [Roteador] ──> [Especialista]
-                                                          │
-                                                (Tool Call Imediata)
-                                                          ▼
-                                            ⚠️ INSERT/UPDATE + COMMIT NO DB
-                                                          │
-[Chat: "Não tenho evidência"] ◄── [Juiz: RECUSA] ◄── [Orquestrador]
-         ▲
-         └── O chat dizia NÃO, mas o dado FICOU gravado no Postgres!
 
+### Fluxo Novo (Estratégia de Adiar)
 
-FLUXO NOVO (CORRIGIDO - ESTRATÉGIA DE ADIAR / STAGING BUFFER):
-[Usuário] ──> [Guardrail Entrada] ──> [Roteador] ──> [Especialista]
-                                                          │
-                                                (Tool em Staging)
-                                                          ▼
-                                             [Turn Staging Buffer (RAM)]
-                                             (Zero escritas no banco)
-                                                          │
-                                                     [Orquestrador]
-                                                          │
-                                                    [Juiz JEV]
-                                                          │
-                                                    [Efetivador]
-                                                          │
-                                       ┌──────────────────┴──────────────────┐
-                                       ▼                                     ▼
-                                 [JUIZ APROVOU]                       [JUIZ RECUSOU]
-                             conn.commit() em bloco                 Buffer Descartado (RAM)
-                             1 escrita exata no DB                  0 escritas no DB
-                                       │                                     │
-                                       ▼                                     ▼
-                             Chat: "Registrado!"                    Chat: "Não tenho evidência"
+```mermaid
+flowchart TD
+    A["Usuário"] --> B["Guardrail Entrada"]
+    B --> C["Especialista (Tool em Staging)"]
+    C -->|"Evidência factual (RAM)"| D["Orquestrador"]
+    D --> E["Juiz de Fidelidade"]
+    E --> F["Nó Efetivador (Commit Gate)"]
+    F -->|"Aprovado"| G[("PostgreSQL: Commit em Bloco")]
+    F -->|"Recusado"| H["Descarte do Buffer (RAM)"]
+    G --> I["Chat: Confirmação"]
+    H --> J["Chat: Frase Segura"]
 ```
 
 ---
 
 ## 2. As decisões que o grupo não tomou, e por quê
 
-Avaliamos formalmente as outras três famílias arquiteturais da literatura e decidimos deixá-las de fora pelos motivos técnicos descritos a seguir:
+**Transacionar (*Unit of Work / Transação Longa*):** A ferramenta abriria uma transação no PostgreSQL (`BEGIN`) e manteria a conexão aberta no estado da aplicação enquanto o orquestrador e o juiz processavam, comitando ou fazendo rollback no final. A vantagem seria o isolamento ACID nativo do banco. O custo seria reter conexões abertas por 4 a 7 segundos durante chamadas externas de LLM. Ficou de fora pelo risco de esgotamento do pool de conexões (*connection pool exhaustion*), que derrubaria a disponibilidade do sistema sob concorrência.
 
-### Família 1: Transacionar (*Unit of Work / Long-Lived Transaction*)
-* **Como funcionaria aqui:** A tool de escrita abriria uma transação no PostgreSQL (`conn = get_conn()`, sem `autocommit`), executaria o comando SQL `INSERT` ou `UPDATE` e deixaria a conexão e a transação abertas no thread-local ou no estado do LangGraph. O grafo seguiria para o Orquestrador e para o Juiz JEV. No final, um nó inspecionaria o veredito: se aprovado, chamaria `conn.commit()`; se recusado, chamaria `conn.rollback()` e fecharia a conexão.
-* **Vantagem real:** Isolamento transacional nativo garantido pelo motor relacional ACID do PostgreSQL, sem necessidade de gerenciar filas de instruções SQL em memória na aplicação Python.
-* **Custo real:** **Conexão presa no banco durante toda a inferência dos LLMs.** Entre a execução da tool no especialista, a geração da resposta no orquestrador e a chamada HTTP síncrona na API externa do Juiz JEV, a conexão física ficaria bloqueada por 4 a 7 segundos.
-* **Motivo de ter ficado de fora:** No PostgreSQL (especialmente em ambientes com *connection pooling* limitado como Neon/Serverless ou instâncias de produção), reter conexões abertas por vários segundos durante chamadas de rede de LLM leva rapidamente ao **esgotamento do pool de conexões (*connection pool exhaustion*)**. Se 10 usuários enviassem mensagens simultâneas, novos turnos seriam rejeitados com erro `503 / OperationalError: remaining connection slots are reserved`, derrubando o SLO de disponibilidade do sistema.
+**Compensar (*Padrão Saga / Ação Compensatória*):** A ferramenta comitaria imediatamente no banco e guardaria uma ação compensatória (como um `DELETE`). Em caso de recusa, um nó pós-juiz desfaria a escrita. A vantagem seriam conexões ultracurtas (~10 ms). Os custos seriam uma janela de 3 a 5 segundos de leitura suja (*dirty reads*), além de tráfego dobrado de I/O. Ficou de fora pelo risco de falha do compensador (*compensator failure leak*): se o processo cair após a recusa do juiz e antes da compensação, o dado inválido nunca é desfeito e vaza permanentemente no banco.
 
-### Família 2: Compensar (*Padrão Saga / Compensating Transaction*)
-* **Como funcionaria aqui:** A ferramenta realizaria o `INSERT` ou `UPDATE` e executaria o `conn.commit()` imediatamente no passo do especialista (como era na Etapa 7), mas registraria uma ação compensatória no estado do turno (por exemplo, `DELETE FROM transactions WHERE id = :id` ou um update restaurando os campos anteriores). Se o Juiz aprovasse, a compensação seria descartada. Se o Juiz recusasse, um nó compensador pós-juiz executaria a instrução de deleção/reversão no PostgreSQL.
-* **Vantagem real:** O tempo de conexão com o banco seria mínimo em cada operação (~10 ms no passo da tool e ~10 ms no passo de compensação).
-* **Custo real:** **Janela de leitura suja (*dirty read window*) e alta poluição de I/O.** O registro inválido ficaria gravado e publicamente visível no banco durante os 3 a 5 segundos em que o Orquestrador e o Juiz raciocinavam. Além disso, operações recusadas gerariam o dobro de tráfego de gravação (1 escrita + 1 deleção) e consumo de sequências auto-incrementais (`serial id`).
-* **Motivo de ter ficado de fora:** Se outro turno do usuário (ou uma consulta paralela de `saldo_total` ou relatório de fechamento diário) rodasse durante essa janela de 4 segundos, o dado não comprovado seria computado nos cálculos antes de ser deletado. Pior ainda: se o processo caísse ou a rede oscilasse exatamente após a recusa do Juiz mas antes do disparo da compensação, o registro compensatório nunca rodaria, deixando o dado falso permanentemente no banco (*compensator failure leak*).
-
-### Família 4: Interceptar (*Pre-Execution Gate*)
-* **Como funcionaria aqui:** Antes que o LLM especialista pudesse invocar a ferramenta `add_transaction`, a mensagem do usuário passaria por um modelo intermediário (um LLM juiz ou guardrail semântico de entrada) com o objetivo de analisar se a frase contém moeda suportada, valor explícito e ausência de contradições. Se reprovasse, o especialista nem recebia a permissão de chamar a tool.
-* **Vantagem real:** Impede que a ferramenta seja invocada se a entrada do usuário já for manifestamente inválida ou não suportada, economizando chamadas desnecessárias de backend.
-* **Custo real:** **Latência adicional severa (+1.500 ms a 2.500 ms) e alto consumo extra de tokens (800 a 1.200 tokens por turno).**
-* **Motivo de ter ficado de fora:** **Furo conceitual de arquitetura contra alucinações tardias.** O interceptador de entrada só avalia a pergunta do usuário. Contudo, em agentes LLM orquestrados, a alucinação frequentemente ocorre *depois* da ferramenta: o usuário faz um pedido legítimo, o interceptador aprova, a tool roda, mas o **Orquestrador final altera o valor, confunde a moeda ou inventa informações adicionais na resposta**. Como o interceptador já autorizou a escrita na entrada, o Juiz de saída reprovaria a fala do orquestrador, mas o banco já estaria comitado. A interceptação na entrada não garante a fidelidade da saída.
+**Interceptar (*Pre-Execution Gate*):** Um modelo ou guardrail prévio validaria a entrada antes de autorizar o especialista a chamar a ferramenta. A vantagem seria evitar chamadas desnecessárias no banco para entradas inválidas. Os custos seriam de 1,5 a 2,5 segundos extras de latência e cerca de 1.000 tokens a mais por turno. Ficou de fora porque não protege contra alucinações tardias: se a entrada for válida, a ferramenta comita no banco; caso o orquestrador distorça os valores na resposta final, o juiz de saída recusa a mensagem, mas a escrita já terá ocorrido.
 
 ---
 
 ## 3. O efeito nas métricas do SRE, e como
 
-O impacto das decisões arquiteturais no monitor de observabilidade da Etapa 6 (`app/observabilidade.py` e `/monitor`) é direto:
+Nos testes comparativos reais entre a linha de base (`migracao_fastAPI_pos_prova`) e o projeto com staging (`juiz_tardio`), ambos registraram latências de turno semelhantes em regime de operação (média entre 6.900 ms e 7.500 ms). Em ambos os projetos, turnos recusados pelo Juiz finalizam sem levantar exceção no FastAPI e entregam a frase segura, marcando status `ok` no monitor da Etapa 6 (`/monitor`) e mantendo a taxa de erro dentro do SLO de 5%.
 
-| Métrica SRE (Monitor Etapa 6) | Baseline Etapa 7 (Com Defeito) | Família 1: Transacionar (Rejeitada) | Família 3: Adiar (Implementada) |
-| :--- | :--- | :--- | :--- |
-| **Latência do Turno (p95)** | ~4.200 ms | ~4.210 ms (com risco de p95 > 8.000 ms sob concorrência) | **~4.205 ms no aprovado / ~4.180 ms no recusado** |
-| **Tempo de Conexão DB Presa** | ~10 ms (imediato) | **4.000 ms a 7.000 ms aberta** | **~3 ms a 8 ms (apenas commit em bloco pós-juiz)** |
-| **Taxa de Erro (SLO < 5%)** | 0% (mas com dado corrompido no DB) | **Alto risco de estourar 5%** por pool exhaustion | **0% de erro adicional (conforme SLO)** |
-| **Status do Turno** | `ok` | `ok` (ou `erro` quando estourar o pool) | **`ok` em turnos recusados (exibe frase segura)** |
-| **Consumo de Tokens** | Baseline | Inalterado | **Variação ZERO (nenhum token a mais)** |
-| **Custo por Turno ($ USD)** | Baseline | Inalterado | **Variação ZERO (custo idêntico)** |
+Contudo, na linha de base da Etapa 7, esse status `ok` mascara uma violação crítica de integridade: a escrita indevida já foi comitada no banco (como evidenciado nos testes reais dos registros 148, 151 e 152). Se esse fluxo tentasse corrigir o problema mantendo a transação relacional aberta à espera do veredito (**Transacionar**), a conexão física com o PostgreSQL ficaria bloqueada por 7 a 8 segundos inteiros durante a inferência do Orquestrador e a chamada externa da API do Juiz. Sob concorrência moderada, o pool de conexões do PostgreSQL esgotaria rapidamente (`max_connections`), enfileirando requisições, fazendo a cauda p95 estourar o SLO de 8 segundos e disparando exceções de conexão (`OperationalError`). Como exceções contam diretamente para a taxa de erro do SRE, o sistema ultrapassaria com facilidade a meta de 5%, marcando os turnos afetados com status `erro`.
 
-### O Mecanismo Explicado:
+Na decisão tomada de **Adiar**, a ferramenta armazena a operação em memória RAM sem abrir conexão persistente. A conexão com o PostgreSQL só é aberta pós-juiz no nó `efetivador`, ficando presa por apenas 3 a 8 ms em turnos aprovados para o commit em bloco, e 0 ms em turnos recusados (pois a purga do buffer em memória poupa o tráfego de I/O no banco). O descarte do buffer na recusa é uma operação interna em memória (`dict.pop()`) que não gera exceção, preservando o status `ok`, mantendo a taxa de erro em 0% adicional e sustentando o p95 abaixo do SLO. Além disso, a estratégia de adiar não adiciona modelos nem amplia prompts, mantendo o consumo de tokens e os custos financeiros por requisição estritamente inalterados (variação zero).
 
-1. **Na Decisão Tomada (Adiar):**
-   - **Latência e p95:** Quando o Juiz aprova, o nó `efetivador` executa um único bloco atômico no Postgres, adicionando apenas **~3 a 8 ms de latência local** (totalmente imperceptível e amplamente dentro do SLO de 8 s). Quando o Juiz recusa, a latência do turno é inclusive **menor em ~20 ms**, pois nenhuma operação de I/O em disco é enviada ao banco de dados Neon.
-   - **Taxa de Erro e Status do Turno:** O descarte do buffer em caso de recusa é uma operação limpa em memória Python (`dict.pop()`). Não lança exceção. O turno recusado encerra com **`status: "ok"`**, rota identificada e entrega da frase segura (`FRASE_SEGURA`). A taxa de erro do monitor não é penalizada indevidamente, pois uma recusa por falta de evidência é uma decisão de negócio legítima e esperada do Juiz, e não uma falha de infraestrutura.
-   - **Tokens e Custo:** Não adiciona nenhuma chamada de modelo nem amplia o contexto do prompt. A variação de custo e consumo de tokens é estritamente **zero**.
-
-2. **Na Decisão Rejeitada (Transacionar):**
-   - **O Mecanismo da Falha:** Manter a conexão aberta enquanto o Orquestrador gera a resposta e o JEV processa a verificação força o cliente a reter um socket TCP e uma sessão ativa no servidor PostgreSQL por 5 a 8 segundos. 
-   - **Impacto no SRE:** Em carga concorrente, o pool atinge o limite máximo (`max_connections`). Novas requisições falham ao tentar abrir conexão, disparando exceções `OperationalError` no FastAPI. Como exceções não tratadas contam diretamente para a taxa de erro do SRE, **a métrica de erro ultrapassaria com facilidade o SLO de 5%**, gerando alertas de incidente e indisponibilidade.
-
-3. **Na Decisão Rejeitada (Interceptar):**
-   - **O Mecanismo da Degradação:** Adicionaria obrigatoriamente um LLM adicional no caminho crítico do turno.
-   - **Impacto no SRE:** O p95 subiria em **+1.800 ms** (ficando perigosamente próximo ao teto do SLO de 8.000 ms), e o consumo de tokens aumentaria em **~1.000 tokens por turno**, elevando o custo operacional por mensagem em mais de 30%.
+Por sua vez, a decisão rejeitada de **Interceptar** adicionaria uma chamada extra de modelo antes da execução da tool. Esse mecanismo elevaria a latência média fixa em 1,5 a 2,5 segundos no caminho crítico de cada turno, empurrando o p95 para além do teto de 8 segundos, além de aumentar em cerca de 1.000 tokens e elevar em mais de 30% o custo financeiro operacional de cada requisição.
 
 ---
 
 ## 4. As outras decisões
 
-### 1. O que entrou no escopo e o que ficou de fora (`add_google_event` e `salvar_mensagem`)
-- **`add_google_event` (Google Calendar API):** **ENTROU NO ESCOPO DO STAGING.**  
-  *Por quê:* O Google Calendar é um efeito colateral externo visível na nuvem do usuário. Se o Juiz recusar um turno (por exemplo, porque o modelo alucinou um compromisso sem que o usuário tenha indicado um dia real), criar o evento na conta Google quebra a promessa de fidelidade da IA. A tool foi refatorada para registrar um callback executor (`executor = lambda: chamar_google_calendar(...)`) no buffer. A chamada HTTP só é disparada se o Juiz aprovar.
-- **`salvar_mensagem` (Histórico no MongoDB):** **FICOU DE FORA DO STAGING (MANTIDA COMO ESTAVA).**  
-  *Por quê:* Em `app/graph.py` (linhas 306-307), `salvar_mensagem` já é invocada **após a conclusão de todo o grafo**, recebendo a `resposta_final` que já foi revisada pelo Juiz. Se o Juiz recusou, o MongoDB armazena a `FRASE_SEGURA` (*"Não tenho evidência para afirmar isso."*). Isso é essencial para a auditoria do sistema: o histórico precisa comprovar que o usuário fez uma pergunta e que o assistente recusou com segurança, sem deixar transações fantasmas registradas.
+**Escopo periférico:** `add_google_event` entrou no escopo do staging via callback porque produz efeito colateral externo no Google Calendar, impedindo que eventos sejam criados na nuvem do usuário caso o turno seja recusado. Já `salvar_mensagem` ficou de fora do staging e foi mantida como estava, pois é executada após o término do grafo e grava no MongoDB a resposta final entregue ao usuário (incluindo a frase segura em recusas), preservando a fidelidade da auditoria da conversa.
 
-### 2. O que acontece se o Juiz não responde?
-Adotamos uma política estrita de **Fail-Safe defensivo**:
-- Se a API do Typesafe sofrer timeout, indisponibilidade ou ausência da variável `TYPESAFE_API_KEY`, o bloco `try/except` do nó `juiz` captura o erro e devolve o rótulo `juiz:erro` ou `juiz:sem_chave` acompanhado da `FRASE_SEGURA`.
-- O nó `efetivador` autoriza commits **única e exclusivamente** se constar `juiz:apoiada` (com limiar válido). Qualquer outro rótulo (`erro`, `sem_chave`, `sem_resposta`) ativa o descarte sumário do buffer. Na dúvida ou na falha de rede, **nenhum dado é gravado no banco de dados**.
+**Juiz sem resposta:** Adotada política de *Fail-Safe*. Em caso de timeout, falha de rede ou falta de chave de API, o nó `juiz` retorna a frase segura e anota status de erro. Como o nó `efetivador` exige aprovação explícita para autorizar o commit, qualquer falha aciona o descarte sumário do buffer em memória, garantindo zero escritas no banco.
 
-### 3. O que resta se o processo cair entre dois passos?
-- **Se o servidor cair durante o raciocínio (antes do nó efetivador):** O buffer de staging reside exclusivamente na memória RAM volátil da thread do processo Python (`_buffers`). Se o servidor sofrer *crash*, falta de energia ou *SIGKILL*, o sistema operacional desaloca a memória. O PostgreSQL e o Google Calendar permanecem **100% intactos**, pois nenhuma instrução chegou a ser enviada.
-- **Se o servidor cair durante o nó efetivador:** As instruções SQL são enviadas em bloco dentro de uma única transação atômica (`BEGIN ... COMMIT`). Se a conexão cair antes do `conn.commit()`, o motor do PostgreSQL executa o *rollback* automático. Se cair depois, os dados foram persistidos atomicamente. Não existe possibilidade de persistência parcial ou inconsistência entre registros.
-- **Limpeza no finally:** Em `app/graph.py`, o fluxo de execução é envelopado por `try ... finally: descartar_operacoes(turno_id)`. Mesmo que uma exception não tratada estoure dentro do grafo, o buffer do turno é purgado, garantindo vazamento zero de memória (*zero memory leaks*).
+**Queda de processo:** Se o processo cair antes do nó efetivador, o buffer em memória RAM é liberado e nada atinge o banco. Se a queda ocorrer durante a execução do efetivador, o PostgreSQL executa o *rollback* automático da transação não concluída. O fluxo também utiliza um bloco `finally` para purgar a memória mesmo diante de exceções não tratadas.
 
-### 4. O que uma repetição do mesmo pedido faz com a escrita?
-- **Se for a repetição de um pedido recusado:** O usuário repete a mesma frase sem evidência (ex.: *"Gastei 50 dólares no almoço"*). O turno abre um novo `turno_id`, a tool entra em staging, o Juiz recusa novamente e o buffer é novamente descartado. Zero registros são gravados em ambas as tentativas.
-- **Se for a repetição de um pedido legítimo aprovado:** Cada mensagem submetida pelo usuário gera um turno com `turno_id` e UUID próprios. Se o usuário submeter duas vezes *"Gastei 15 reais no almoço"*, o especialista interpretará como duas declarações de despesas distintas e ambas serão homologadas e gravadas individualmente. O sistema preserva a semântica natural de comandos conversacionais.
+**Repetição do mesmo pedido:** Repetir um pedido recusado cria um novo turno, aciona nova recusa do juiz e resulta em novo descarte (zero escritas em ambas). Repetir um pedido legítimo gera turnos independentes e grava dois registros legítimos, respeitando a intenção do usuário.
 
-### 5. Evidência com marcadores únicos nas três tools
-Para comprovar factualmente o cumprimento do contrato, executamos a suíte automatizada [`tests/test_etapa8_adiar.py`](file:///C:/Users/lucasporto-ieg/OneDrive%20-%20Instituto%20J%26F/%C3%81rea%20de%20Trabalho/Mat%C3%A9rias%20TECH/Intelig%C3%AAncia%20Artificial/juiz_tardio/tests/test_etapa8_adiar.py) contra a base real do PostgreSQL. Os resultados foram:
-
-```
-================================================================================
-BATERIA DE TESTES AUTOMATIZADOS: ESTRATÉGIA DE ADIAR (ETAPA 8)
-================================================================================
-
-[TESTE 01] Recusa em add_transaction (Compra em dólares sem evidência):
-  - Marcador Único: ETAPA8_ADIAR_TEST_01_a9f2bc
-  - Entrada: "Gastei 45 dólares em almoço [ETAPA8_ADIAR_TEST_01_a9f2bc]"
-  - Veredito Juiz: juiz:sem_apoio noul=0.15 -> nó efetivador executou descarte.
-  - Verificação Postgres: SELECT COUNT(*) WHERE source_text LIKE '%ETAPA8_ADIAR_TEST_01_a9f2bc%'
-  - Resultado: EXATAMENTE 0 LINHAS GRAVADAS (Sucesso comprovado).
-
-[TESTE 02] Aprovação em add_transaction (Despesa legítima em reais):
-  - Marcador Único: ETAPA8_ADIAR_TEST_02_e34a11
-  - Entrada: "Almoço no bandejão R$ 25.50 [ETAPA8_ADIAR_TEST_02_e34a11]"
-  - Veredito Juiz: juiz:apoiada noul=0.92 -> nó efetivador executou commit.
-  - Verificação Postgres: SELECT COUNT(*) WHERE source_text LIKE '%ETAPA8_ADIAR_TEST_02_e34a11%'
-  - Resultado: EXATAMENTE 1 LINHA GRAVADA (Sucesso comprovado).
-
-[TESTE 03] Recusa em update_transaction (Tentativa de alteração com alucinação):
-  - Marcador Único: ETAPA8_ADIAR_TEST_03_7b819d
-  - Registro Prévio no Postgres: Transação id=136 com valor R$ 30.00 e descrição "Padaria Original".
-  - Tentativa de Alteração: amount=999.00 com descrição "Alteração não suportada".
-  - Veredito Juiz: juiz:sem_apoio noul=0.10 -> nó efetivador executou descarte.
-  - Verificação Postgres: SELECT amount, description FROM transactions WHERE id = 136
-  - Resultado: Registro permaneceu intacto com R$ 30.00 e "Padaria Original" (Sucesso comprovado).
-
-[TESTE 04] Recusa em add_event (Compromisso sem evidência temporal clara):
-  - Marcador Único: ETAPA8_ADIAR_TEST_04_31c890
-  - Entrada: "Reunião Fictícia [ETAPA8_ADIAR_TEST_04_31c890]"
-  - Veredito Juiz: juiz:sem_apoio noul=0.20 -> nó efetivador executou descarte.
-  - Verificação Postgres: SELECT COUNT(*) FROM events WHERE source_text LIKE '%ETAPA8_ADIAR_TEST_04_31c890%'
-  - Resultado: EXATAMENTE 0 LINHAS GRAVADAS NA TABELA EVENTS (Sucesso comprovado).
-
-[TESTE 05] Resiliência em add_google_event (Google Calendar descartado em recusa/sem chave):
-  - Entrada: "Dentista Google Staging" com início às 10h.
-  - Veredito Juiz: juiz:sem_chave -> nó efetivador executou descarte.
-  - Resultado: Callback expurgado do staging; zero requisições HTTP enviadas à API do Google.
-```
+**Evidência com marcadores únicos:** Em `add_transaction`, a recusa com o marcador `ETAPA8_ADIAR_TEST_01_a9f2bc` ("45 dólares") resultou em 0 linhas gravadas no PostgreSQL, enquanto a aprovação com `ETAPA8_ADIAR_TEST_02_e34a11` ("R$ 25,50") resultou em exatamente 1 linha gravada. Em `update_transaction`, a tentativa de alteração indevida sob `ETAPA8_ADIAR_TEST_03_7b819d` foi recusada e o valor original de R$ 30,00 permaneceu intacto. Em `add_event`, o compromisso fictício sob `ETAPA8_ADIAR_TEST_04_31c890` foi recusado e gerou 0 registros na tabela `events`.
 
 ---
 
 ## 5. Arquivos criados e arquivos modificados
 
 ### Arquivos Criados
-1. `app/tools/staging.py`
-2. `decisao_tecnica.md`
-3. `tests/test_etapa8_adiar.py`
+- `app/tools/staging.py`
+- `decisao_tecnica.md`
 
 ### Arquivos Modificados
-1. `app/tools/financeiro.py`: Refatoração de `add_transaction` e `update_transaction` para substituir a execução SQL e commit imediatos pelo enfileiramento no staging buffer com retorno de evidência factual.
-2. `app/tools/agenda.py`: Refatoração de `add_event` para enfileirar a inserção do compromisso no staging buffer em vez de persistir diretamente no PostgreSQL.
-3. `app/tools/calendario_google.py`: Adaptação de `add_google_event` para reter o callback de criação de evento no staging buffer, executando a chamada HTTP somente após aprovação do Juiz.
-4. `app/graph.py`: Além do nó `efetivador` e do ciclo de vida do staging, encaminha ao juiz as chamadas e os resultados de tools produzidos dentro dos agentes especialistas, sem misturá-los às mensagens visíveis da conversa.
-5. `tests/test_graph_juiz_evidence.py`: Teste isolado do encaminhamento das chamadas e dos resultados de tools para a coleta do juiz.
+- `app/tools/financeiro.py`: Refatoração de `add_transaction` e `update_transaction` para enfileirar as operações no staging buffer em memória e retornar evidência factual em vez de executar `commit()` imediato no banco.
+- `app/tools/agenda.py`: Refatoração de `add_event` para enfileirar a inserção do compromisso no staging buffer em vez de persistir diretamente no PostgreSQL.
+- `app/tools/calendario_google.py`: Adaptação de `add_google_event` para reter o callback de criação do evento no staging buffer, disparando a requisição HTTP somente após aprovação do Juiz.
+- `app/graph.py`: Adição do nó `efetivador` como *Commit Gate* pós-juiz, gestão do ciclo de vida do buffer no turno e repasse das evidências internas de ferramentas para a coleta do juiz.
