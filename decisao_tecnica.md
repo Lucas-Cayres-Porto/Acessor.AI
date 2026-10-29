@@ -1,23 +1,17 @@
 # Decisão Técnica — Etapa 8: O Juiz e a Escrita
 
-**Projeto:** Assessor Pessoal com Inteligência Artificial  
-**Mecanismo Escolhido:** Estratégia de Adiar com buffer temporário de turno  
-**Repositório:** `juiz_tardio`
-
----
-
 ## 1. A decisão tomada, e por quê
 
 Na Etapa 7, as ferramentas `add_transaction`, `update_transaction` e `add_event` salvavam e comitavam direto no PostgreSQL durante o passo do especialista. Quando o juiz recusava a resposta por alucinação, o chat mostrava a mensagem de recusa, mas o dado já tinha sido gravado no banco. O chat dizia não, mas o banco dizia sim.
 
-Por isso, eu e o Cayres escolhemos a estratégia de adiar com buffer temporário de turno. A fronteira que autoriza a escrita saiu da ferramenta e foi para o nó `efetivador`, colocado no grafo logo após o juiz e antes do nó final `END`.
+Por isso, a estratégia de adiar com buffer temporário de turno. A fronteira que autoriza a escrita saiu da ferramenta e foi para o nó `efetivador`, colocado no grafo logo após o juiz e antes do nó final `END`.
 
 Essa ideia cabe perfeitamente no LangGraph. A ferramenta valida os dados com um `SELECT`, monta o comando na memória e guarda na fila de staging do turno, devolvendo uma mensagem de sucesso com as informações preparadas. Assim, o especialista e o juiz recebem a evidência factual do que foi feito. Quando o juiz aprova a resposta como apoiada, o nó efetivador grava tudo no banco de uma vez só. Se o juiz recusar, o buffer é descartado da memória sem tocar no PostgreSQL.
 
 Essa fronteira garante que:
-- Em `add_transaction`: se o juiz recusar, nada é gravado no banco, resultando em zero linhas; se aprovar, grava exatamente uma vez.
-- Em `update_transaction`: se recusar, nenhum comando roda e o registro antigo fica intacto; se aprovar, atualiza uma vez.
-- Em `add_event`: se recusar, nenhum compromisso entra na tabela; se aprovar, salva uma vez.
+- Em `add_transaction`: se o juiz recusar, nada é gravado no banco, resultando em zero linhas. Se aprovar, grava exatamente uma vez.
+- Em `update_transaction`: se recusar, nenhum comando roda e o registro antigo fica intacto. Se aprovar, atualiza uma vez.
+- Em `add_event`: se recusar, nenhum compromisso entra na tabela. Se aprovar, salva uma vez.
 - Evita leituras sujas de dados não confirmados, porque nada entra no banco enquanto os modelos ainda estão processando.
 
 ### Fluxo de antes
