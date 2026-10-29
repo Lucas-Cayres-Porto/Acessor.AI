@@ -70,6 +70,7 @@ faq_app = create_agent(
 # ==============================================================================
 class Estado(MessagesState):
     agentes_chamados: Annotated[list[str], operator.add]
+    evidencias_juiz: list
     rota: str
     status_turno: str
     mapa_pii: dict
@@ -103,8 +104,15 @@ def _executar_agente(app, nome_agente: str, estado: Estado, config: RunnableConf
     if not resposta and saida.get("messages"):
         ultimo = saida["messages"][-1]
         resposta = getattr(ultimo, "content", "") if not isinstance(ultimo, dict) else ultimo.get("content", "")
+    evidencias_juiz = [
+        mensagem
+        for mensagem in saida.get("messages", [])
+        if getattr(mensagem, "type", None) == "tool"
+        or (getattr(mensagem, "type", None) == "ai" and getattr(mensagem, "tool_calls", None))
+    ]
     return {
         "agentes_chamados": [nome_agente],
+        "evidencias_juiz": evidencias_juiz,
         "messages": [{"role": "assistant", "content": resposta or ""}],
     }
 
@@ -206,7 +214,14 @@ def no_guardrail_saida(estado: Estado) -> dict:
     }
 
 def no_juiz(estado: dict) -> dict:
-    pergunta, resposta, evidencia = _coleta(estado)
+    estado_com_evidencias = dict(estado)
+    mensagens = estado.get("messages", [])
+    estado_com_evidencias["messages"] = [
+        *mensagens[:-1],
+        *estado.get("evidencias_juiz", []),
+        *mensagens[-1:],
+    ]
+    pergunta, resposta, evidencia = _coleta(estado_com_evidencias)
     if not resposta:
         return {"agentes_chamados": ["juiz:sem_resposta"]}
     try:

@@ -4,7 +4,7 @@
 **Mecanismo Escolhido:** Família 3 — Estratégia de Adiar (*Turn Staging Buffer / Two-Phase Action*)  
 **Repositório:** `juiz_tardio`  
 **Data:** 28 de Outubro de 2026  
-**Status:** Implementado, Testado e Validado  
+**Status:** Estratégia implementada; correção do repasse feita em 29 de outubro de 2026. O teste isolado foi criado, mas sua execução não terminou neste ambiente.
 
 ---
 
@@ -21,6 +21,20 @@ O LangGraph organiza o fluxo em nós desacoplados com estado compartilhado (`Est
 A Estratégia de Adiar cabe perfeitamente nessa topologia porque divide o ciclo da tool em duas fases:
 1. **Fase de Staging (Inferência):** A tool valida o esquema, checa existência com `SELECT` pontual, monta a instrução SQL, enfileira a operação na memória do turno e devolve um payload de sucesso estruturado contendo toda a evidência factual (`status: ok`, `staging: True`, `amount`, `type`, `occurred_at`). Isso abastece o especialista, o orquestrador e o juiz com evidências idênticas às reais, sem tocar na persistência do banco.
 2. **Fase de Efetivação (Commit Gate):** O nó `efetivador` inspeciona a lista `agentes_chamados`. Se constar a homologação explícita do Juiz (`juiz:apoiada` com `noul >= 0.70`), o nó consome a fila e efetiva todas as mutações em bloco numa única transação atômica. Se constar recusa (`sem_apoio`, `parcial`, `erro`, `sem_chave` ou limiar insuficiente), o nó simplesmente descarta a fila em memória.
+
+### Correção do repasse de evidências ao juiz (29/10/2026)
+
+Foi identificada uma lacuna entre essa descrição e o fluxo real do grafo: `_executar_agente` executa o especialista em uma chamada interna (`app.invoke`), mas devolvia ao grafo externo somente a resposta final do especialista. As mensagens internas com `tool_calls` e os resultados `ToolMessage` ficavam de fora do estado compartilhado. Como `app/juiz.py::_coleta` procura essas evidências em `messages`, o JEV podia receber a resposta final sem os argumentos e resultados das tools — inclusive quando a tool havia preparado uma operação no staging.
+
+A correção fica em `app/graph.py` e não altera `app/juiz.py`, o prompt, o limiar ou a lógica de decisão do JEV:
+
+1. O estado do grafo agora tem `evidencias_juiz`, uma lista separada com as mensagens internas do agente que contêm chamadas de tools e seus resultados.
+2. `_executar_agente` conserva essas mensagens ao retornar ao grafo, além da resposta final que já retornava.
+3. `no_juiz` cria uma cópia temporária do estado e insere nela as evidências imediatamente antes da resposta final, para que `_coleta` não confunda eventual texto auxiliar de uma chamada de tool com a resposta entregue ao usuário. A lista `messages` original do grafo não é modificada; as evidências internas não aparecem como novas falas na conversa.
+
+O teste isolado `tests/test_graph_juiz_evidence.py` foi criado para verificar que argumentos e resultado de uma tool chegam à coleta usada por `no_juiz`, sem conexão ao PostgreSQL e sem chamada real à API do JEV. A execução excedeu 30 segundos durante a importação de `app.graph`; portanto, o teste ainda não está validado por execução. Mesmo aprovado, ele não comprova, por si só, decisão real do JEV nem gravação final de um evento.
+
+**Limites que permanecem:** evidência de staging mostra que a operação foi preparada, não que foi efetivada. Como o Juiz ocorre antes do `efetivador`, esta correção não torna a confirmação de persistência ou de sincronização com o Google Calendar uma evidência pós-commit. Além disso, `_coleta` limita a evidência enviada ao JEV aos últimos 6.000 caracteres; em turnos com muitas chamadas ou resultados longos, evidências iniciais ainda podem ser truncadas. Esses comportamentos pertencem ao fluxo/contrato atual do juiz e não foram alterados nesta correção.
 
 ### Qual garantia ela dá em `add_transaction`, `update_transaction` e `add_event`
 - **Em `add_transaction`:** Se o turno for recusado, nenhum `INSERT` é executado no banco; o contador de linhas na tabela `transactions` permanece inalterado (zero escritas). Se aprovado, a inserção é executada exatamente uma única vez com `conn.commit()`.
@@ -201,4 +215,5 @@ BATERIA DE TESTES AUTOMATIZADOS: ESTRATÉGIA DE ADIAR (ETAPA 8)
 1. `app/tools/financeiro.py`: Refatoração de `add_transaction` e `update_transaction` para substituir a execução SQL e commit imediatos pelo enfileiramento no staging buffer com retorno de evidência factual.
 2. `app/tools/agenda.py`: Refatoração de `add_event` para enfileirar a inserção do compromisso no staging buffer em vez de persistir diretamente no PostgreSQL.
 3. `app/tools/calendario_google.py`: Adaptação de `add_google_event` para reter o callback de criação de evento no staging buffer, executando a chamada HTTP somente após aprovação do Juiz.
-4. `app/graph.py`: Adição do nó `efetivador` entre o `juiz` e o `END` no grafo, e gerenciamento do ciclo de vida do staging buffer (abertura e descarte de segurança no finally) em `executar_fluxo_assessor`.
+4. `app/graph.py`: Além do nó `efetivador` e do ciclo de vida do staging, encaminha ao juiz as chamadas e os resultados de tools produzidos dentro dos agentes especialistas, sem misturá-los às mensagens visíveis da conversa.
+5. `tests/test_graph_juiz_evidence.py`: Teste isolado do encaminhamento das chamadas e dos resultados de tools para a coleta do juiz.
