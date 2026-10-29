@@ -1,0 +1,46 @@
+# Ambientes e Variáveis Secretas
+.env
+.env.*
+!.env.example
+*.env
+
+# Credenciais e Tokens Google / GCP
+gcp-oauth.keys.json
+!gcp-oauth.keys.example.json
+google-calendar.token.json
+*.token.json
+credentials.json
+client_secret*.json
+
+# Backups e diretórios locais
+_segredos_backup/
+backup_segredos/
+*.bak
+
+# Python Caches e Ambientes Virtuais
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+
+# IDEs e Editores
+.cursor/
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Sistema Operacional
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs e Bancos Locais
+*.log
+*.sqlite3
+*.db
