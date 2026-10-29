@@ -63,28 +63,6 @@ Colocar um modelo para julgar o pedido do usuário antes de deixar a ferramenta 
 
 No monitor de observabilidade da Etapa 6, fizemos a comparação direta entre a versão anterior do projeto em `migracao_fastAPI_pos_prova` e a versão atual em `juiz_tardio`:
 
-### Comparativo visual de latência e integridade
-
-```mermaid
-xychart-beta
-    title "Latencia Media do Turno em segundos contra Meta de 8s"
-    x-axis ["Projeto Anterior", "Projeto Atual", "Transacionar", "Interceptar"]
-    y-axis "Tempo em segundos" 0 --> 14
-    bar [7.2, 7.2, 11.8, 9.6]
-    line [8.0, 8.0, 8.0, 8.0]
-```
-
-```mermaid
-flowchart TD
-    subgraph Comparativo_SRE["Visao Geral das Metricas e Integridade"]
-        direction TB
-        A["Projeto Anterior migracao_fastAPI_pos_prova: Latencia 7.2s | Status ok | Banco corrompido na recusa"]
-        B["Projeto Atual juiz_tardio: Latencia 7.2s | Status ok | Banco 100% integro com zero linhas"]
-        C["Transacionar conexao aberta: Latencia maior que 11s | Status erro | Pool de conexoes esgotado"]
-        D["Interceptar LLM antes: Latencia maior que 9.5s | Status ok | Custo 30% maior em tokens"]
-    end
-```
-
 **Comparação com o projeto anterior:**  
 No projeto anterior `migracao_fastAPI_pos_prova`, a média de latência do turno já ficava entre 6,9 s e 7,5 s, com o p95 dentro da meta de 8 segundos e a taxa de erro marcando status `ok` ao devolver a frase segura. No entanto, aquele status `ok` escondia uma falha crítica de integridade: a escrita errada já tinha sido gravada no PostgreSQL antes da decisão do juiz. Na versão atual `juiz_tardio`, o tempo de resposta permanece praticamente idêntico, gastando apenas de 3 a 8 ms a mais para comitar no banco se o juiz aprovar, e economizando cerca de 20 ms nas recusas porque nem tenta gravar. A grande diferença é que agora o status `ok` reflete a realidade, pois nenhuma linha entra no banco se o juiz recusar.
 
@@ -100,19 +78,6 @@ Em relação ao projeto anterior, a estratégia de adiar teve impacto zero no co
 ---
 
 ## 4. As outras decisões
-
-### Ciclo de vida da operação no staging
-
-```mermaid
-stateDiagram-v2
-    direction LR
-    [*] --> NaFilaRAM: Tool prepara operacao
-    NaFilaRAM --> AvaliacaoJuiz: Orquestrador gera resposta
-    AvaliacaoJuiz --> CommitBanco: Juiz aprova
-    AvaliacaoJuiz --> DescarteRAM: Juiz recusa
-    CommitBanco --> [*]: Salvo com sucesso
-    DescarteRAM --> [*]: Zero linhas gravadas
-```
 
 **O que entrou e ficou de fora:**  
 O `add_google_event` entrou no escopo do staging: a ferramenta guarda um callback e só chama a API do Google Calendar se o juiz aprovar, evitando criar eventos errados na agenda real. Já o `salvar_mensagem` ficou de fora do staging: o histórico do MongoDB é salvo mesmo na recusa, pois serve para auditoria da conversa real que o usuário viu.
